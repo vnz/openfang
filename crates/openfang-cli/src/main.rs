@@ -4220,6 +4220,31 @@ fn cmd_config_set(key: &str, value: &str) {
     }
 
     let last_key = parts[parts.len() - 1];
+
+    // Validate: single-part keys must be known scalar fields, not sections.
+    // Writing a section name as a scalar silently breaks config deserialization.
+    if parts.len() == 1 {
+        let known_scalars = [
+            "home_dir",
+            "data_dir",
+            "log_level",
+            "api_listen",
+            "network_enabled",
+            "api_key",
+            "language",
+            "max_cron_jobs",
+            "usage_footer",
+            "workspaces_dir",
+        ];
+        if !known_scalars.contains(&last_key) {
+            ui::error_with_fix(
+                &format!("'{last_key}' is a section, not a scalar"),
+                &format!("Use dotted notation: {last_key}.field_name"),
+            );
+            std::process::exit(1);
+        }
+    }
+
     let tbl = current.as_table_mut().unwrap_or_else(|| {
         ui::error(&format!("Parent of '{key}' is not a table"));
         std::process::exit(1);
