@@ -3925,16 +3925,24 @@ impl OpenFangKernel {
                                 .await
                                 {
                                     Ok(Ok(result)) => {
-                                        tracing::info!(job = %job_name, "Cron job completed successfully");
-                                        kernel.cron_scheduler.record_success(job_id);
-                                        // Deliver response to configured channel
-                                        cron_deliver_response(
+                                        // Deliver response, then record success/failure
+                                        match cron_deliver_response(
                                             &kernel,
                                             agent_id,
                                             &result.response,
                                             &delivery,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                tracing::info!(job = %job_name, "Cron job completed successfully");
+                                                kernel.cron_scheduler.record_success(job_id);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(job = %job_name, error = %e, "Cron job delivery failed");
+                                                kernel.cron_scheduler.record_failure(job_id, &e);
+                                            }
+                                        }
                                     }
                                     Ok(Err(e)) => {
                                         let err_msg = format!("{e}");
@@ -3984,15 +3992,23 @@ impl OpenFangKernel {
                                 .await
                                 {
                                     Ok(Ok((_run_id, output))) => {
-                                        tracing::info!(job = %job_name, "Cron workflow completed");
-                                        kernel.cron_scheduler.record_success(job_id);
-                                        cron_deliver_response(
+                                        match cron_deliver_response(
                                             &kernel,
                                             agent_id,
                                             &output,
                                             &delivery,
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                tracing::info!(job = %job_name, "Cron workflow completed");
+                                                kernel.cron_scheduler.record_success(job_id);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(job = %job_name, error = %e, "Cron workflow delivery failed");
+                                                kernel.cron_scheduler.record_failure(job_id, &e);
+                                            }
+                                        }
                                     }
                                     Ok(Err(e)) => {
                                         let err_msg = format!("{e}");
@@ -5302,15 +5318,15 @@ async fn cron_deliver_response(
     agent_id: AgentId,
     response: &str,
     delivery: &openfang_types::scheduler::CronDelivery,
-) {
+) -> Result<(), String> {
     use openfang_types::scheduler::CronDelivery;
 
     if response.is_empty() {
-        return;
+        return Ok(());
     }
 
     match delivery {
-        CronDelivery::None => {}
+        CronDelivery::None => Ok(()),
         CronDelivery::Channel { channel, to } => {
             tracing::debug!(channel = %channel, to = %to, "Cron: delivering to channel");
             // Persist as last channel for this agent (survives restarts)
@@ -5322,14 +5338,12 @@ async fn cron_deliver_response(
             // Deliver via the registered channel adapter (reuses existing
             // SlackAdapter / MatrixAdapter with their HTTP clients, auth,
             // message splitting, and API version handling).
-            match kernel.send_channel_message(channel, to, response, None).await {
-                Ok(_) => {
-                    tracing::info!(channel = %channel, to = %to, "Cron: delivered to channel");
-                }
-                Err(e) => {
-                    tracing::warn!(channel = %channel, to = %to, error = %e, "Cron channel delivery failed");
-                }
-            }
+            kernel.send_channel_message(channel, to, response, None).await.map(|_| {
+                tracing::info!(channel = %channel, to = %to, "Cron: delivered to channel");
+            }).map_err(|e| {
+                tracing::warn!(channel = %channel, to = %to, error = %e, "Cron channel delivery failed");
+                format!("channel delivery failed: {e}")
+            })
         }
         CronDelivery::LastChannel => {
             match kernel
@@ -5351,6 +5365,7 @@ async fn cron_deliver_response(
                     tracing::debug!("Cron: no last channel found for agent {}", agent_id);
                 }
             }
+            Ok(())
         }
         CronDelivery::Webhook { url } => {
             tracing::debug!(url = %url, "Cron: delivering via webhook");
@@ -5372,6 +5387,7 @@ async fn cron_deliver_response(
                     }
                 }
             }
+            Ok(())
         }
     }
 }
