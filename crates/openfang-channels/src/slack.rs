@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn test_slack_adapter_unfurl_links_default_true() {
+    fn test_slack_adapter_unfurl_links_enabled() {
         let adapter = SlackAdapter::new(
             "xapp-test".to_string(),
             "xoxb-test".to_string(),
