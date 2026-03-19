@@ -358,21 +358,24 @@ pub async fn send_message(
         );
     }
 
-    // Resolve file attachments into image content blocks
-    if !req.attachments.is_empty() {
+    // Resolve file attachments into image content blocks.
+    // Pass them as content_blocks so the LLM receives them in the current turn
+    // (not as a separate session message which the LLM may not process).
+    let content_blocks = if !req.attachments.is_empty() {
         let image_blocks = resolve_attachments(&req.attachments);
-        if !image_blocks.is_empty() {
-            inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
-        }
-    }
+        if image_blocks.is_empty() { None } else { Some(image_blocks) }
+    } else {
+        None
+    };
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
         .kernel
-        .send_message_with_handle(
+        .send_message_with_handle_and_blocks(
             agent_id,
             &req.message,
             Some(kernel_handle),
+            content_blocks,
             req.sender_id,
             req.sender_name,
         )
@@ -1412,6 +1415,7 @@ pub async fn send_message_stream(
         Some(kernel_handle),
         req.sender_id,
         req.sender_name,
+        None, // SSE streaming doesn't support image attachments yet
     ) {
         Ok(pair) => pair,
         Err(e) => {
@@ -10114,6 +10118,66 @@ pub async fn cron_job_status(
             Json(serde_json::json!({"error": "Invalid job ID"})),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Run cron job on demand
+// ---------------------------------------------------------------------------
+
+/// POST /api/cron/jobs/{id}/run — Trigger a cron job immediately.
+///
+/// Returns `{"status": "triggered", "job_id": "..."}` and spawns the execution
+/// in the background.  The job's status can be polled via
+/// `GET /api/cron/jobs/{id}/status`.
+pub async fn run_cron_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let uuid = match uuid::Uuid::parse_str(&id) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "error", "error": "Invalid job ID"})),
+            );
+        }
+    };
+    let job_id = openfang_types::scheduler::CronJobId(uuid);
+
+    // Atomically check existence + enabled + reserve next_run in one lock hold.
+    let job = match state.kernel.cron_scheduler.try_claim_for_run(job_id) {
+        Ok(j) => j,
+        Err(openfang_kernel::cron::ClaimError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"status": "error", "error": "Job not found"})),
+            );
+        }
+        Err(openfang_kernel::cron::ClaimError::Disabled) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "error", "error": "Job is disabled"})),
+            );
+        }
+    };
+
+    // Spawn execution in the background so we don't block the HTTP response.
+    let kernel = Arc::clone(&state.kernel);
+    let job_name = job.name.clone();
+    tokio::spawn(async move {
+        match kernel.cron_run_job(&job).await {
+            Ok(_) => tracing::info!(job = %job_name, "On-demand cron job completed"),
+            Err(e) => tracing::warn!(job = %job_name, error = %e, "On-demand cron job failed"),
+        }
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "triggered",
+            "job_id": id,
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------
